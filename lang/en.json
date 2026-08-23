@@ -1,0 +1,16 @@
+{
+  "MRINGS.SelectLabel": "Token Ring",
+  "MRINGS.FieldLabel": "Ring Texture",
+  "MRINGS.WorldDefault": "Default",
+  "MRINGS.CombinedConfigLabel": "Multiple Rings",
+  "MRINGS.SettingEnabledName": "Multiple dynamic ring support",
+  "MRINGS.SettingEnabledHint": "Allows several dynamic rings to be displayed at the same time.",
+  "MRINGS.SettingBakeScaleName": "Resolution scale",
+  "MRINGS.SettingBakeScaleHint": "Resolution of the rendered rings. Lower this if your device is not powerful enough.",
+  "MRINGS.WarnNoSheets": "No rings found.",
+  "MRINGS.WarnBuildFailed": "Multiple Rings: initialization failed",
+  "MRINGS.WarnPatchFailed": "Multiple Rings: Foundry API changed; initialization failed.",
+  "MRINGS.WarnCapacity": "The ring atlas is full.",
+  "MRINGS.AEOverrideNote": "Ring overridden by an active effect",
+  "MRINGS.DAEDescription": "Choose a visual style for the token's dynamic ring."
+}

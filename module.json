@@ -1,0 +1,56 @@
+{
+  "id": "multiple-rings",
+  "title": "Multiple Rings",
+  "version": "14.1.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "14",
+    "maximum": "14"
+  },
+  "relationships": {
+    "requires": [
+      {
+        "id": "lib-wrapper",
+        "type": "module",
+        "compatibility": {}
+      }
+    ],
+    "systems": [
+      {
+        "id": "dnd5e",
+        "type": "system",
+        "compatibility": {}
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/main.js"
+  ],
+  "languages": [
+    {
+      "lang": "en",
+      "name": "English",
+      "path": "lang/en.json",
+      "flags": {}
+    },
+    {
+      "lang": "ru",
+      "name": "Russian",
+      "path": "lang/ru.json",
+      "flags": {}
+    }
+  ],
+  "authors": [
+    {
+      "name": "SweetyHake",
+      "email": "sweetyhake@gmail.com",
+      "discord": "SweetyHake",
+      "flags": {}
+    }
+  ],
+  "url": "https://github.com/SweetyHake/multiple-rings",
+  "manifest": "https://raw.githubusercontent.com/SweetyHake/multiple-rings/main/module.json",
+  "download": "https://github.com/SweetyHake/multiple-rings/releases/latest/download/module.zip",
+  "description": "<p>Choose a different dynamic token ring style for each token, selected from all registered rings (core and module-provided).</p>",
+  "flags": {}
+}

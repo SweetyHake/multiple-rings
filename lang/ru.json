@@ -1,0 +1,16 @@
+{
+  "MRINGS.SelectLabel": "Кольцо токена",
+  "MRINGS.FieldLabel": "Текстура кольца",
+  "MRINGS.WorldDefault": "По умолчанию",
+  "MRINGS.CombinedConfigLabel": "Multiple Rings",
+  "MRINGS.SettingEnabledName": "Поддержка нескольких динамических колец",
+  "MRINGS.SettingEnabledHint": "Позволяет отображать несколько динамических колец одновременно.",
+  "MRINGS.SettingBakeScaleName": "Масштаб разрешения",
+  "MRINGS.SettingBakeScaleHint": "Разрешение отображаемых колец. Уменьшите разрешение, если ваше устройство недостаточно производительное.",
+  "MRINGS.WarnNoSheets": "Кольца не найдены.",
+  "MRINGS.WarnBuildFailed": "Multiple Rings: Ошибка инициализации",
+  "MRINGS.WarnPatchFailed": "Multiple Rings: API Foundry изменилось; ошибка инициализации.",
+  "MRINGS.WarnCapacity": "Атлас колец переполнен.",
+  "MRINGS.AEOverrideNote": "Кольцо переопределено активным эффектом",
+  "MRINGS.DAEDescription": "Выберите визуальный стиль динамического кольца токена."
+}
