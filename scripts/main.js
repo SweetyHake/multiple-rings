@@ -20,6 +20,7 @@ let wrappersInstalled = false;
 let rebuildInProgress = false;
 let rebuildPromise = Promise.resolve();
 let evictTimer = null;
+const warnedUnknownPacks = new Set();
 
 // Metadata registry built from JSONs only (no images needed)
 // key = "<cfgId>:<frameName>"
@@ -252,7 +253,10 @@ async function preloadRegistries() {
 
       let frames = json.frames;
       if (!frames && json.config?.frames) frames = json.config.frames;
-      if (!frames) continue;
+      if (!frames) {
+        console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet} has no recognizable frames — skipped`);
+        continue;
+      }
 
       const dir = cfg.spritesheet.slice(0, cfg.spritesheet.lastIndexOf("/") + 1);
       const rects = [];
@@ -261,7 +265,10 @@ async function preloadRegistries() {
         if (!fr) continue;
         rects.push({ key: `${cfgId}:${name}`, data: f, w: fr.w, h: fr.h });
       }
-      if (!rects.length) continue;
+      if (!rects.length) {
+        console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet} has no drawable frames — skipped`);
+        continue;
+      }
       rects.sort((a, b) => b.h - a.h);
 
       const src = { imgPath: dir + json.meta.image, rects, config: json.config ?? {} };
@@ -303,7 +310,10 @@ async function preloadRegistries() {
 
   // Resolve which config the world actually uses; fall back to first known
   worldConfigId ??= ring.id;
-  if (!sheetFrameIds.has(worldConfigId)) {
+  const worldIndexed = sheetFrameIds.has(worldConfigId);
+  console.log(`${MODULE_ID} | world ring setting "${worldConfigId}" ${worldIndexed ? "indexed" : "NOT indexed"}; ` +
+    `indexed packs: ${[...sheetFrameIds.keys()].join(", ") || "(none)"}`);
+  if (!worldIndexed) {
     worldConfigId = sheetFrameIds.keys().next().value ?? null;
   }
 
@@ -575,6 +585,10 @@ function applyRingContext(token) {
     setAllowed(sheetFrameIds.get(worldConfigId) ?? null);
     // Kick off lazy baking; the token redraws once ready
     if (rid && !failedSheets.has(rid) && booted && !rebuildInProgress && !pendingSheets.has(rid)) {
+      if (!sheetFrameIds.has(rid) && !warnedUnknownPacks.has(rid)) {
+        warnedUnknownPacks.add(rid);
+        console.warn(`${MODULE_ID} | token "${token?.name ?? "?"}" requests unknown ring pack "${rid}" — using world default`);
+      }
       materializeSheet(rid).then(ok => {
         if (!ok) return;
         try { token.renderFlags?.set({ redraw: true }); } catch { /* noop */ }
@@ -697,6 +711,14 @@ async function activateFlow() {
     const ok = await preloadRegistries();
     if (!ok) {
       ui.notifications.warn(game.i18n.localize("MRINGS.WarnNoSheets"));
+      return;
+    }
+
+    // Never take over rendering with a substituted world pack: if the actual
+    // world setting could not be indexed, staying native preserves its look.
+    if (!sheetFrameIds.has(worldConfigId)) {
+      ui.notifications.warn(game.i18n.localize("MRINGS.WarnBuildFailed"));
+      console.warn(`${MODULE_ID} | world ring pack "${worldConfigId}" could not be indexed — staying on native rendering`);
       return;
     }
 
