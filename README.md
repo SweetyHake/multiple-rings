@@ -6,6 +6,8 @@ Foundry allows only one dynamic ring style per world. This module removes that l
 
 Requires [lib-wrapper](https://foundryvtt.com/packages/lib-wrapper).
 
+![Tokens wearing different dynamic rings](screenshots/tokens-with-different-rings.png)
+
 ---
 
 ## What you get
@@ -29,6 +31,8 @@ Leave it on **Default** to follow the usual priority:
 ```
 Active Effect → token → actor prototype → world setting
 ```
+
+![Ring selector in token configuration](screenshots/token-config-ring-select.png)
 
 ### Through an Active Effect
 
