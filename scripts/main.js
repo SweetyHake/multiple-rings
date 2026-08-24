@@ -330,8 +330,14 @@ async function preloadRegistries() {
 
   ringRegistry.sort((a, b) => a.gridTarget - b.gridTarget);
 
-  // Resolve which config the world actually uses; fall back to first known
-  worldConfigId ??= ring.id;
+  // Resolve which config the world actually uses.
+  // NOTE: do NOT use CONFIG.Token.ring.id here — module-registered packs
+  // (e.g. SETT) build DynamicRingData without an `id` field, so cfg.id is ""
+  // even though the config map key is a real id. The world SETTING stores
+  // the map key directly, which is exactly what we need.
+  let worldSetting = null;
+  try { worldSetting = game.settings.get("core", "dynamicTokenRing") ?? null; } catch { /* noop */ }
+  worldConfigId ??= worldSetting;
   const worldIndexed = sheetFrameIds.has(worldConfigId);
   console.log(`${MODULE_ID} | world ring setting "${worldConfigId}" ${worldIndexed ? "indexed" : "NOT indexed"}; ` +
     `indexed packs: ${[...sheetFrameIds.keys()].join(", ") || "(none)"}`);
