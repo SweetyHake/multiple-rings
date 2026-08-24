@@ -1,6 +1,6 @@
 # Multiple Rings
 
-**Different dynamic token rings for different tokens — in Foundry VTT v14.**
+**Different dynamic token rings for different tokens — for Foundry VTT v13+.**
 
 Foundry allows only one dynamic ring style per world. This module removes that limit: every token can wear its own ring, chosen from all installed ring packs (core steel & bronze plus any added by other modules).
 
