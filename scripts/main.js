@@ -1,4 +1,4 @@
-const MODULE_ID = "multiple-rings";
+﻿const MODULE_ID = "multiple-rings";
 const RING_SELECT_ID = "multiple-rings-appearance-select";
 const FLAG_PATH = `flags.${MODULE_ID}.ringAppearance`;
 const MEGA_ID = "mringsCombinedRings";
@@ -238,6 +238,22 @@ function warnCapacityOnce() {
 /* Preload: fetch JSONs, build metadata registry, size the atlas      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Resolve a spritesheet's meta.image against the sheet location.
+ * Handles relative paths, absolute/protocol URLs, data: and blob: URIs вЂ”
+ * custom rings (e.g. SETT) may register any of these.
+ */
+function resolveImageURL(src) {
+  const img = src.metaImage;
+  if (/^(data|blob|https?|ftp):/i.test(img) || img.startsWith("/")) return img;
+  try {
+    return new URL(img, new URL(src.sheetSrc, location.origin)).href;
+  } catch {
+    const dir = src.sheetSrc.slice(0, src.sheetSrc.lastIndexOf("/") + 1);
+    return dir + img;
+  }
+}
+
 async function preloadRegistries() {
   const ring = CONFIG.Token.ring;
   const ids = (ring.configIDs ?? []).filter(id => id !== MEGA_ID);
@@ -254,11 +270,10 @@ async function preloadRegistries() {
       let frames = json.frames;
       if (!frames && json.config?.frames) frames = json.config.frames;
       if (!frames) {
-        console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet} has no recognizable frames — skipped`);
+        console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet} has no recognizable frames вЂ” skipped`);
         continue;
       }
 
-      const dir = cfg.spritesheet.slice(0, cfg.spritesheet.lastIndexOf("/") + 1);
       const rects = [];
       for (const [name, f] of Object.entries(frames)) {
         const fr = f.frame;
@@ -266,12 +281,19 @@ async function preloadRegistries() {
         rects.push({ key: `${cfgId}:${name}`, data: f, w: fr.w, h: fr.h });
       }
       if (!rects.length) {
-        console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet} has no drawable frames — skipped`);
+        console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet} has no drawable frames вЂ” skipped`);
         continue;
       }
       rects.sort((a, b) => b.h - a.h);
 
-      const src = { imgPath: dir + json.meta.image, rects, config: json.config ?? {} };
+      // Remember raw locations; image URL is resolved lazily per pack
+      const src = {
+        imgPath: null,
+        rects,
+        config: json.config ?? {},
+        sheetSrc: cfg.spritesheet,
+        metaImage: json.meta.image
+      };
       sheetSources.set(cfgId, src);
 
       // Metadata registry with PER-SHEET default colors baked per frame
@@ -341,7 +363,7 @@ function createAtlas() {
   const candidates = manual != null ? [manual] : [1, 0.75, 0.5];
 
   // Pick the highest quality whose full layout fits the GPU texture limit.
-  // If none fits (auto mode), fall back to the smallest candidate at max width —
+  // If none fits (auto mode), fall back to the smallest candidate at max width вЂ”
   // lazy baking + per-pack graceful fallback handle any remaining overflow.
   atlasW = Math.min(2048, maxTex);
   activeScale = candidates[candidates.length - 1];
@@ -437,12 +459,14 @@ async function materializeSheet(cfgId) {
 
   const job = (async () => {
     const src = sheetSources.get(cfgId);
+    const cfg = CONFIG.Token.ring.getConfig(cfgId);
     if (!src || !atlasCtx) { failedSheets.add(cfgId); return false; }
     try {
       let tex = materialized.get(cfgId);
       if (!tex) {
+        src.imgPath ??= resolveImageURL(src);
         tex = await loadTexture(src.imgPath);
-        if (!tex?.baseTexture?.valid) throw new Error("image load failed");
+        if (!tex?.baseTexture?.valid) throw new Error(`image load failed: ${src.imgPath}`);
       }
       const ok = bakeSheetPixels(cfgId, tex);
       if (!ok) { failedSheets.add(cfgId); return false; }
@@ -527,6 +551,7 @@ async function rebuildAtlas(reason) {
       let tex = materialized.get(cfgId);
       if (!tex?.baseTexture?.valid) {
         try {
+          src.imgPath ??= resolveImageURL(src);
           tex = await loadTexture(src.imgPath);
           if (!tex?.baseTexture?.valid) throw new Error("reload failed");
         } catch (e) {
@@ -587,7 +612,7 @@ function applyRingContext(token) {
     if (rid && !failedSheets.has(rid) && booted && !rebuildInProgress && !pendingSheets.has(rid)) {
       if (!sheetFrameIds.has(rid) && !warnedUnknownPacks.has(rid)) {
         warnedUnknownPacks.add(rid);
-        console.warn(`${MODULE_ID} | token "${token?.name ?? "?"}" requests unknown ring pack "${rid}" — using world default`);
+        console.warn(`${MODULE_ID} | token "${token?.name ?? "?"}" requests unknown ring pack "${rid}" вЂ” using world default`);
       }
       materializeSheet(rid).then(ok => {
         if (!ok) return;
@@ -718,13 +743,13 @@ async function activateFlow() {
     // world setting could not be indexed, staying native preserves its look.
     if (!sheetFrameIds.has(worldConfigId)) {
       ui.notifications.warn(game.i18n.localize("MRINGS.WarnBuildFailed"));
-      console.warn(`${MODULE_ID} | world ring pack "${worldConfigId}" could not be indexed — staying on native rendering`);
+      console.warn(`${MODULE_ID} | world ring pack "${worldConfigId}" could not be indexed вЂ” staying on native rendering`);
       return;
     }
 
     createAtlas();
 
-    // Bake the world-default sheet first — everything falls back to it
+    // Bake the world-default sheet first вЂ” everything falls back to it
     const worldBaked = await materializeSheet(worldConfigId);
     if (!worldBaked) {
       ui.notifications.warn(game.i18n.localize("MRINGS.WarnBuildFailed"));
