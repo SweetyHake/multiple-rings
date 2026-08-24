@@ -681,7 +681,7 @@ function installPatches() {
 
 async function activateFlow() {
   if (booted || !isEnabled()) return;
-  if (game.release.generation !== 14) return;
+  if (game.release.generation < 13) return;
 
   // Self-heal: reset internal config accidentally picked as world setting
   try {
