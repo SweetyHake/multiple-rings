@@ -1,7 +1,7 @@
 {
   "id": "multiple-rings",
   "title": "Multiple Rings",
-  "version": "14.2.0",
+  "version": "14.2.8",
   "compatibility": {
     "minimum": "13",
     "verified": "14",
@@ -12,13 +12,6 @@
       {
         "id": "lib-wrapper",
         "type": "module",
-        "compatibility": {}
-      }
-    ],
-    "systems": [
-      {
-        "id": "dnd5e",
-        "type": "system",
         "compatibility": {}
       }
     ]

@@ -3,8 +3,6 @@
   "MRINGS.FieldLabel": "Ring Texture",
   "MRINGS.WorldDefault": "Default",
   "MRINGS.CombinedConfigLabel": "Multiple Rings",
-  "MRINGS.SettingEnabledName": "Multiple dynamic ring support",
-  "MRINGS.SettingEnabledHint": "Allows several dynamic rings to be displayed at the same time.",
   "MRINGS.WarnNoSheets": "No rings found.",
   "MRINGS.WarnBuildFailed": "Multiple Rings: initialization failed",
   "MRINGS.WarnPatchFailed": "Multiple Rings: Foundry API changed; initialization failed.",

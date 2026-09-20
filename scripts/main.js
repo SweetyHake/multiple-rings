@@ -1,4 +1,6 @@
-﻿const MODULE_ID = "multiple-rings";
+﻿import {buildTopLayerClasses, TOP_LAYER_EFFECT} from "./top-ring.mjs";
+
+const MODULE_ID = "multiple-rings";
 const RING_SELECT_ID = "multiple-rings-appearance-select";
 const FLAG_PATH = `flags.${MODULE_ID}.ringAppearance`;
 const MEGA_ID = "mringsCombinedRings";
@@ -32,6 +34,9 @@ let wrappersInstalled = false;
 let rebuildInProgress = false;
 let rebuildPromise = Promise.resolve();
 let evictDebounce = null;
+// {TopRingSamplerShader, setTopAtlas} when the top layer ("two-layer
+// token") is supported by this core build, null otherwise
+let topLayerClasses = null;
 const warnedUnknownPacks = new Set();
 const warnedNoWearers = new Set();  // cfgId -> "no wearers yet" logged once
 
@@ -39,6 +44,7 @@ const warnedNoWearers = new Set();  // cfgId -> "no wearers yet" logged once
 // key = "<cfgId>:<frameName>"
 const ringRegistry = [];
 const sheetFrameIds = new Map();   // cfgId -> Set<prefixed keys>
+const sheetScale = new Map();      // cfgId -> visual token scale (sheet config.scale)
 const sheetSources = new Map();    // cfgId -> { imgPath, rects, config }
 const materialized = new Map();    // cfgId -> PIXI.Texture (source image, kept while baked)
 const failedSheets = new Set();
@@ -46,12 +52,20 @@ const pendingSheets = new Map();   // cfgId -> Promise<boolean>
 const variantJobs = new Map();     // cfgId -> Promise<boolean> (variant top-up bakes)
 const sheetSlots = new Map();      // cfgId -> [{key,x,y,w,h}]
 const lastUsed = new Map();        // cfgId -> Date.now()
+const topImageCache = new Map();   // overlay file url -> Promise<PIXI.Texture|null>
+const resolvedTopImages = new Map(); // overlay file url -> PIXI.Texture (after load)
 
 // Atlas packing state
 let atlasCanvas = null;
 let atlasCtx = null;
 let atlasBaseTexture = null;
 let atlasSheet = null;
+// Shadow atlas: same dimensions as the main one, overlay frames blitted at
+// the same rects as their ring frames, so the top-layer shader can address
+// it with the ring's own UVs (core's attribute budget is already full)
+let topAtlasCanvas = null;
+let topAtlasCtx = null;
+let topAtlasBaseTexture = null;
 let atlasW = 2048;
 let atlasH = 1024;
 let packX = 0, packY = 0, packRowH = 0;
@@ -71,29 +85,30 @@ function setAllowed(v) { moduleContext.allowed = v; }
 /* ------------------------------------------------------------------ */
 /* Settings & registration                                            */
 /* ------------------------------------------------------------------ */
-
-Hooks.once("init", () => {
-  game.settings.register(MODULE_ID, "enabled", {
-    name: "MRINGS.SettingEnabledName",
-    hint: "MRINGS.SettingEnabledHint",
-    scope: "world",
-    config: true,
-    default: true,
-    type: Boolean,
-    requiresReload: true
-  });
-});
+/* No module settings: when the per-token ring choices are not wanted,
+ * disable the module itself in Manage Modules. */
 
 Hooks.on("initializeDynamicTokenRingConfig", (ringConfig) => {
   try {
     const DynamicRingData = foundry.canvas.placeables.tokens.DynamicRingData;
+    topLayerClasses = buildTopLayerClasses();
     ringConfig.addConfig(MEGA_ID, new DynamicRingData({
       id: MEGA_ID,
       label: game.i18n.localize("MRINGS.CombinedConfigLabel"),
-      spritesheet: MEGA_SHEET_KEY
+      spritesheet: MEGA_SHEET_KEY,
+      // Only the shader is swapped: the ringClass stays native because core
+      // recreates ring instances only when none exists yet, so a custom
+      // class would never reach tokens drawn before activation. The top
+      // layer rides TokenRing.prototype patches instead (see installPatches).
+      ...(topLayerClasses ? {
+        framework: {
+          shaderClass: topLayerClasses.TopRingSamplerShader
+        }
+      } : {})
     }));
     hideInternalConfig();
   } catch (e) {
+    topLayerClasses = null;
     console.warn(`${MODULE_ID} | failed to register combined ring config`, e);
   }
 });
@@ -118,11 +133,6 @@ function hideInternalConfig() {
   } catch (e) {
     console.warn(`${MODULE_ID} | failed to hide internal ring config`, e);
   }
-}
-
-function isEnabled() {
-  try { return game.settings.get(MODULE_ID, "enabled") !== false; }
-  catch { return true; }
 }
 
 /** Next ladder step strictly below s, or null when already at the bottom. */
@@ -301,6 +311,38 @@ async function preloadRegistries() {
         console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet} has no drawable frames вЂ” skipped`);
         continue;
       }
+
+      // Top-layer companions: `config.overlays` maps a base frame name to an
+      // extra frame drawn ABOVE the token subject. The rect points either
+      // into the sheet image itself (`frame` only) or into a separate file
+      // (`image` + `frame`, resolved relative to the sheet URL). Neither
+      // PIXI nor the core ring renderer read that block, so with the module
+      // disabled the sheet behaves as a normal ring sheet.
+      const topByBase = new Map();
+      const overlayDefs = (json.config ?? {}).overlays;
+      if (overlayDefs && typeof overlayDefs === "object") {
+        for (const [baseName, ov] of Object.entries(overlayDefs)) {
+          const fr = ov?.frame;
+          if (!fr) continue;
+          if (!frames[baseName]) {
+            console.warn(`${MODULE_ID} | sheet ${cfg.spritesheet}: overlay "${baseName}" has no matching base frame вЂ” skipped`);
+            continue;
+          }
+          const key = `${cfgId}:${baseName}-top`;
+          rects.push({
+            key,
+            data: { frame: fr },
+            w: fr.w,
+            h: fr.h,
+            isTop: true,
+            imageOverride: ov.image
+              ? new URL(ov.image, new URL(cfg.spritesheet, location.origin)).href
+              : null
+          });
+          topByBase.set(baseName, key);
+        }
+      }
+
       rects.sort((a, b) => b.h - a.h);
 
       // Group frames into size variants: a base frame plus its optional
@@ -309,7 +351,7 @@ async function preloadRegistries() {
       // in actual use get baked (see bakeRects).
       const variantTargets = new Map();
       for (const r of rects) {
-        if (r.key.endsWith("-bkg") || r.key.endsWith("-msk")) continue;
+        if (r.isTop || r.key.endsWith("-bkg") || r.key.endsWith("-msk")) continue;
         variantTargets.set(r.key, r.data.gridTarget ?? 1);
       }
       for (const r of rects) {
@@ -338,12 +380,21 @@ async function preloadRegistries() {
 
       sheetFrameIds.set(cfgId, new Set(rects.map(r => r.key)));
 
+      // Ring scale: `config.scale` from the sheet JSON magnifies the ring art
+      // relative to the token (subject unchanged). Core ignores the field; the
+      // configureSize patch feeds it in as scaleMultiplier (1/scale).
+      const packScale = Number(src.config.scale);
+      if (Number.isFinite(packScale) && packScale > 0) {
+        sheetScale.set(cfgId, Math.min(10, Math.max(0.1, packScale)));
+      }
+
       for (const r of rects) {
-        if (r.key.endsWith("-bkg") || r.key.endsWith("-msk")) continue;
+        if (r.isTop || r.key.endsWith("-bkg") || r.key.endsWith("-msk")) continue;
         const fm = r.data;
         const rc = colorToLE(fm.ringColor, defRC);
         const bc = colorToLE(fm.backgroundColor, defBC);
         const ringThickness = fm.ringThickness ?? DEFAULT_RING_THICKNESS;
+        const topName = topByBase.get(r.key.slice(cfgId.length + 1));
         ringRegistry.push({
           ringName: r.key,
           bkgName: `${r.key}-bkg`,
@@ -352,7 +403,8 @@ async function preloadRegistries() {
           gridTarget: fm.gridTarget ?? 1,
           defaultRingColorLittleEndian: rc,
           defaultBackgroundColorLittleEndian: bc,
-          subjectScaleAdjustment: 1 / (ringThickness + DEFAULT_SUBJECT_THICKNESS)
+          subjectScaleAdjustment: 1 / (ringThickness + DEFAULT_SUBJECT_THICKNESS),
+          ...(topName ? { topName } : {})
         });
       }
     } catch (e) {
@@ -393,9 +445,9 @@ function planningSet() {
 /* Size variants                                                      */
 /* ------------------------------------------------------------------ */
 
-/** Strip a frame key's -bkg/-msk companion suffix (base variant key). */
+/** Strip a frame key's -bkg/-msk/-top companion suffix (base variant key). */
 function variantBaseKey(key) {
-  return key.replace(/-(bkg|msk)$/, "");
+  return key.replace(/-(bkg|msk|top)$/, "");
 }
 
 /** Size variants (base frame keys) of a pack that are currently baked. */
@@ -609,7 +661,7 @@ function createAtlas() {
 
   // Retire the previous generation: it stays fully renderable while the new
   // atlas bakes, and commitAtlas() destroys it after tokens have redrawn
-  retiredAtlas = atlasBaseTexture ? { baseTexture: atlasBaseTexture } : null;
+  retiredAtlas = atlasBaseTexture ? { baseTexture: atlasBaseTexture, top: topAtlasBaseTexture } : null;
 
   atlasCanvas = document.createElement("canvas");
   atlasCanvas.width = atlasW;
@@ -623,6 +675,18 @@ function createAtlas() {
     meta: { scale: "1" }
   });
   PIXI.Assets.cache.set(MEGA_SHEET_KEY, atlasSheet);
+
+  // Shadow atlas for the top layer, one generation with the main atlas
+  if (topLayerClasses) {
+    topAtlasCanvas = document.createElement("canvas");
+    topAtlasCanvas.width = atlasW;
+    topAtlasCanvas.height = atlasH;
+    topAtlasCtx = topAtlasCanvas.getContext("2d");
+    topAtlasBaseTexture = PIXI.BaseTexture.from(topAtlasCanvas);
+    topLayerClasses.setTopAtlas(topAtlasBaseTexture);
+  } else {
+    topAtlasCanvas = topAtlasCtx = topAtlasBaseTexture = null;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -706,6 +770,41 @@ const META_KEYS = ["ringColor", "backgroundColor", "colorBand", "gridTarget", "r
  * instead of replacing them; with no rects this is a successful no-op
  * (a pack nobody currently wears bakes nothing).
  */
+/** Overlay art stored in standalone files (`config.overlays[].image`):
+ * loaded once per URL, kept for the session (small PNGs, no eviction). */
+function loadTopImage(url) {
+  let job = topImageCache.get(url);
+  if (!job) {
+    job = (async () => {
+      try {
+        const tex = await foundry.canvas.loadTexture(url);
+        if (!tex?.baseTexture?.valid) throw new Error("invalid texture");
+        resolvedTopImages.set(url, tex);
+        return tex;
+      } catch (e) {
+        console.warn(`${MODULE_ID} | top-layer image "${url}" failed to load — overlay skipped`, e);
+        return null;
+      }
+    })();
+    topImageCache.set(url, job);
+  }
+  return job;
+}
+
+/** Preload every override image a pack's overlays reference. */
+async function ensureTopImages(cfgId) {
+  const src = sheetSources.get(cfgId);
+  if (!src) return;
+  await Promise.all(src.rects
+    .filter(r => r.isTop && r.imageOverride)
+    .map(r => loadTopImage(r.imageOverride)));
+}
+
+/** Resolved texture for an override image, or null while loading / on failure. */
+function topImageTexture(url) {
+  return resolvedTopImages.get(url) ?? null;
+}
+
 function bakeSheetPixels(cfgId, tex, rects, { append = false, defer = false } = {}) {
   const src = sheetSources.get(cfgId);
   if (!src || !atlasCtx) return false;
@@ -718,7 +817,11 @@ function bakeSheetPixels(cfgId, tex, rects, { append = false, defer = false } = 
     const { w: dw, h: dh } = scaledFrameSize(fr, scale);
     const slot = allocSlot(dw, dh);
     if (!slot) break;
-    atlasCtx.drawImage(source, fr.x, fr.y, fr.w, fr.h, slot.x, slot.y, dw, dh);
+    // Overlay frames with an `image` override blit from their own file
+    // (loaded by ensureTopImages); everything else from the sheet texture
+    const overlayTex = (r.isTop && r.imageOverride) ? topImageTexture(r.imageOverride) : null;
+    const rectSource = (overlayTex ?? tex).baseTexture.resource.source;
+    atlasCtx.drawImage(rectSource, fr.x, fr.y, fr.w, fr.h, slot.x, slot.y, dw, dh);
     const extra = Object.fromEntries(Object.entries(r.data).filter(([k]) => META_KEYS.includes(k)));
     atlasSheet.data.frames[r.key] = frameEntry(fr, slot, dw, dh, extra);
     const frameTex = new PIXI.Texture(atlasBaseTexture, new PIXI.Rectangle(slot.x, slot.y, dw, dh));
@@ -741,6 +844,28 @@ function bakeSheetPixels(cfgId, tex, rects, { append = false, defer = false } = 
 
   if (defer) pendingSlots.set(cfgId, slots);
   else sheetSlots.set(cfgId, append ? [...(sheetSlots.get(cfgId) ?? []), ...slots] : slots);
+
+  // Top-layer frames go to the shadow atlas at the SAME rect as their ring
+  // frame — the shader samples it with the ring's own UVs, so the base
+  // frame's slot must already be known (hence after the main loop). Scaled
+  // to the base slot's on-atlas size; overlay and ring art share the same
+  // authored frame size.
+  if (topAtlasCtx) {
+    for (const r of rects) {
+      if (!r.isTop) continue;
+      const slot = slots.find(s => s.key === r.variant);
+      if (!slot) continue;
+      const overlayTex = r.imageOverride ? topImageTexture(r.imageOverride) : null;
+      // No fallback to the sheet texture here: with an override missing
+      // (still loading / failed), the ring frame's rect would sample wrong
+      // pixels — render no overlay instead.
+      if (r.imageOverride && !overlayTex) continue;
+      const rectSource = (overlayTex ?? tex).baseTexture.resource.source;
+      const fr = r.data.frame;
+      topAtlasCtx.drawImage(rectSource, fr.x, fr.y, fr.w, fr.h, slot.x, slot.y, slot.w, slot.h);
+    }
+  }
+
   if (slots.length < rects.length) warnCapacityOnce();
   return slots.length === rects.length;
 }
@@ -774,6 +899,8 @@ function commitAtlas() {
   for (const [cfgId, slots] of pendingSlots) sheetSlots.set(cfgId, slots);
   pendingSlots.clear();
   atlasBaseTexture.update();
+  topAtlasBaseTexture?.update();
+  if (topLayerClasses) topLayerClasses.setTopAtlas(topAtlasBaseTexture);
   // Only when the UV tables actually rebuilt do meshes stop referencing the
   // previous atlas; otherwise it must stay alive (core still samples it)
   const uvRebuilt = booted ? refreshUVs() : false;
@@ -785,7 +912,10 @@ function commitAtlas() {
   // Tokens pick up the new generation on the next frame or two; only then is
   // the previous atlas truly unreferenced and safe to free from the GPU
   if (old && uvRebuilt) {
-    setTimeout(() => { try { old.baseTexture.destroy(); } catch { /* noop */ } }, 2000);
+    setTimeout(() => {
+      try { old.baseTexture.destroy(); } catch { /* noop */ }
+      try { old.top?.destroy(); } catch { /* noop */ }
+    }, 2000);
   }
 }
 
@@ -813,13 +943,15 @@ async function materializeSheet(cfgId, { allowReplan = true } = {}) {
       // an "empty baked" pack would make every draw re-request it, each
       // request "succeeding" and triggering another redraw — an endless
       // chain that keeps the token hidden until its pack is truly baked.
+      // Returns the string "deferred" here (not true) so callers can tell
+      // "nothing baked yet" apart from success and skip their redraws.
       const rects = bakeRects(cfgId);
       if (!rects.length) {
         if (!warnedNoWearers.has(cfgId)) {
           warnedNoWearers.add(cfgId);
           console.log(`${MODULE_ID} | "${cfgId}" has no wearers yet — bake deferred until a token (or open preview) wears it`);
         }
-        return true;
+        return "deferred";
       }
 
       let tex = materialized.get(cfgId);
@@ -828,6 +960,7 @@ async function materializeSheet(cfgId, { allowReplan = true } = {}) {
         tex = await foundry.canvas.loadTexture(src.imgPath);
         if (!tex?.baseTexture?.valid) throw new Error(`image load failed: ${src.imgPath}`);
       }
+      await ensureTopImages(cfgId);
       // If the newly worn pack doesn't fit the current atlas, degrade
       // everyone just enough to make room for it
       if (allowReplan && !packFitsAtlas(cfgId, packScale(cfgId), rects)) {
@@ -838,8 +971,14 @@ async function materializeSheet(cfgId, { allowReplan = true } = {}) {
       materialized.set(cfgId, tex);
       lastUsed.set(cfgId, Date.now());
       atlasBaseTexture.update();
+      topAtlasBaseTexture?.update();
 
-      if (booted) refreshUVs();
+      if (booted) {
+        refreshUVs();
+        // Frames just landed: every placed wearer that drew against the
+        // world default while this bake was in flight must redraw onto them
+        refreshPackWearers(cfgId);
+      }
       warnedNoWearers.delete(cfgId);
       console.log(`${MODULE_ID} | baked ring sheet "${cfgId}" (${sheetSlots.get(cfgId)?.length ?? 0} frames)`);
       return true;
@@ -894,6 +1033,7 @@ async function ensureVariantsFor(cfgId) {
       return bakeRects(cfgId).every(r => have2.has(r.variant));
     }
     if (!missing.length) return true;
+    await ensureTopImages(cfgId);
     if (!packFitsAtlas(cfgId, packScale(cfgId), missing)) {
       createAtlas();
       await rebuildAtlas(`make room for new ring size on "${cfgId}"`);
@@ -903,7 +1043,11 @@ async function ensureVariantsFor(cfgId) {
     }
     bakeSheetPixels(cfgId, tex, missing, { append: true });
     atlasBaseTexture.update();
-    if (booted) refreshUVs();
+    topAtlasBaseTexture?.update();
+    if (booted) {
+      refreshUVs();
+      refreshPackWearers(cfgId);
+    }
     console.log(`${MODULE_ID} | baked ${missing.length} new ring frame(s) for "${cfgId}"`);
     return true;
   })().finally(() => variantJobs.delete(cfgId));
@@ -913,7 +1057,10 @@ async function ensureVariantsFor(cfgId) {
 
 function scheduleTokenRefresh(t) {
   ensureForToken(t).then(ok => {
-    if (!ok) return;
+    // true = frames landed in the atlas; false = bake failed; "deferred" =
+    // nothing was baked (no wearer recorded a need) — redrawing a deferred
+    // token would re-request the same nothing and loop
+    if (ok !== true) return;
     try { t.renderFlags?.set({ redraw: true }); } catch { /* noop */ }
   });
 }
@@ -946,6 +1093,24 @@ function refreshAllRingTokens() {
   // not in the layer's placeables — left stale, they would keep sampling the
   // retired atlas (destroyed shortly after commit) and render as nothing
   for (const clone of canvas.tokens?._configPreview?.children ?? []) {
+    try { clone?.renderFlags?.set({ redraw: true }); } catch { /* noop */ }
+  }
+}
+
+/**
+ * Redraw only the placed tokens (and open preview clones) wearing a given
+ * pack. Called when that pack's frames land in the atlas: every wearer may
+ * have drawn against the world default while the bake was in flight, and a
+ * token that drew mid-bake gets no redraw on its own — the chain attached at
+ * draw time only covers the token whose draw happened to kick the bake off.
+ */
+function refreshPackWearers(cfgId) {
+  for (const t of canvas.tokens?.placeables ?? []) {
+    if (effectivePackOf(t) !== cfgId) continue;
+    try { t.renderFlags?.set({ redraw: true }); } catch { /* noop */ }
+  }
+  for (const clone of canvas.tokens?._configPreview?.children ?? []) {
+    if (effectivePackOf(clone) !== cfgId) continue;
     try { clone?.renderFlags?.set({ redraw: true }); } catch { /* noop */ }
   }
 }
@@ -992,6 +1157,7 @@ async function rebuildAtlas(reason) {
   rebuildInProgress = true;
   const job = (async () => {
     atlasCtx.clearRect(0, 0, atlasW, atlasH);
+    topAtlasCtx?.clearRect(0, 0, atlasW, atlasH);
     atlasSheet.data.frames = {};
     packX = 0; packY = 0; packRowH = 0;
 
@@ -1017,6 +1183,7 @@ async function rebuildAtlas(reason) {
           continue;
         }
       }
+      await ensureTopImages(cfgId);
       if (!bakeSheetPixels(cfgId, tex, bakeRects(cfgId), { defer: true })) {
         warnCapacityOnce();
         failedSheets.add(cfgId);
@@ -1127,6 +1294,7 @@ function buildStatus() {
       startScale: +packStartScale(cfgId).toFixed(2),
       planned: scaleAssignments.has(cfgId),
       frames: sheetFrameIds.get(cfgId)?.size ?? 0,
+      topFrames: [...(sheetFrameIds.get(cfgId) ?? [])].filter(k => k.endsWith("-top")).length,
       bakedSlots: sheetSlots.get(cfgId)?.length ?? 0,
       variants: variantLabel(cfgId),
       variantsAll: sheetSources.get(cfgId)?.variantCount ?? 0,
@@ -1141,7 +1309,6 @@ function buildStatus() {
   const renderer = canvas.app?.renderer;
   return {
     booted,
-    enabled: isEnabled(),
     worldPack: worldConfigId,
     ringsIndexed: ringRegistry.length,
     atlas: {
@@ -1203,7 +1370,7 @@ async function retryFailed() {
   // allowReplan: false — a retry right after a replan must not loop back
   // into replanning if the pack still doesn't fit
   for (const id of ids) results[id] = await materializeSheet(id, { allowReplan: false });
-  console.table(Object.entries(results).map(([id, ok]) => ({ pack: id, baked: ok })));
+  console.table(Object.entries(results).map(([id, ok]) => ({ pack: id, baked: ok === true, deferred: ok === "deferred" })));
   // Redraw tokens that were wearing a pack we just baked
   for (const t of canvas.tokens?.placeables ?? []) {
     if (ids.includes(getEffectiveRingId(t.document))) scheduleTokenRefresh(t);
@@ -1260,22 +1427,27 @@ function applyRingContextInner(token) {
         // Redraw only when the wanted variant actually got baked — otherwise
         // this draw would re-request it and loop the chain forever, hiding
         // the token the whole time
-        if (!ok || !bakedVariantsOf(packId).has(want)) return;
+        if (ok !== true || !bakedVariantsOf(packId).has(want)) return;
         try { token.renderFlags?.set({ redraw: true }); } catch { /* noop */ }
       });
     }
   } else {
     setAllowed(worldBaked?.size ? worldBaked : null);
-    // Kick off lazy baking; the token redraws once ready
-    if (rid && !failedSheets.has(rid) && booted && !rebuildInProgress && !pendingSheets.has(rid)) {
+    // Kick off lazy baking; this token redraws once the frames land. ALWAYS
+    // attach — even when another wearer's bake is already pending or a
+    // rebuild is running (materializeSheet queues behind both and dedupes
+    // via pendingSheets). Skipping the attach here is what left tokens stuck
+    // on the world default: only the token that happened to kick the bake
+    // off ever redrawed when it completed.
+    if (rid && !failedSheets.has(rid) && booted) {
       if (!sheetFrameIds.has(rid) && !warnedUnknownPacks.has(rid)) {
         warnedUnknownPacks.add(rid);
         console.warn(`${MODULE_ID} | token "${token?.name ?? "?"}" requests unknown ring pack "${rid}" вЂ” using world default`);
       }
       materializeSheet(rid).then(ok => {
-        // Same loop guard: a no-op bake (nobody wears the pack yet) must not
-        // schedule another draw that would re-request it
-        if (!ok || !materialized.has(rid) || !bakedVariantsOf(rid).size) return;
+        // Loop guard: deferred (no need recorded yet) or failed bakes must
+        // not schedule another draw that would re-request them
+        if (ok !== true || !materialized.has(rid) || !bakedVariantsOf(rid).size) return;
         try { token.renderFlags?.set({ redraw: true }); } catch { /* noop */ }
       });
     }
@@ -1327,18 +1499,56 @@ function pickRingData(allowed, size) {
   return null;
 }
 
+/* Top-layer support on ANY ring instance: core recreates ring instances
+ * only when none exists (`#initializeRing`), so subclassing cannot reach
+ * tokens drawn before activation. Instead:
+ * - configureSize starts with a clean topName (Object.assign only adds
+ *   keys, so a pack switch must not keep the previous pack's overlay);
+ * - configureVisuals raises the module's TOP_LAYER effect bit after core's
+ *   mask pass whenever the resolved ring variant carries an overlay. */
+
+function patchConfigureSize(wrapper) {
+  // wrapper(wrapped, this) → result
+  const prev = currentAllowed();
+  try {
+    applyRingContext(this.token);
+    this.topName = undefined;
+    return wrapper();
+  } finally {
+    setAllowed(prev);
+  }
+}
+
+/** Visual ring scale of the pack currently applied to a token (1 = none). */
+function getTokenVisualScale(token) {
+  try {
+    const cfgId = getEffectiveRingId(token?.document);
+    const s = cfgId ? sheetScale.get(cfgId) : undefined;
+    return Number.isFinite(s) && s > 0 ? s : 1;
+  } catch {
+    return 1;
+  }
+}
+
+/* Ring scale: configureSize's scaleMultiplier feeds scaleCorrection, where a
+ * value < 1 MAGNIFIES the ring art — and core itself adds the mesh padding
+ * needed so the enlarged ring is not clipped. Pack scale 2 → multiplier ½ →
+ * ring drawn twice as large; the subject texture keeps its own size. */
+function withPackScale(ring, options = {}) {
+  const s = getTokenVisualScale(ring?.token);
+  if (s === 1) return options;
+  const opts = { ...options };
+  opts.scaleMultiplier = (Number.isFinite(opts.scaleMultiplier) ? opts.scaleMultiplier : 1) / s;
+  return opts;
+}
+
 function installLibWrapperPatches() {
   const TokenRing = foundry.canvas.placeables.tokens.TokenRing;
   libWrapper.register(MODULE_ID,
     "foundry.canvas.placeables.tokens.TokenRing.prototype.configureSize",
     function (wrapped, options) {
-      const prev = currentAllowed();
-      try {
-        applyRingContext(this.token);
-        return wrapped.call(this, options);
-      } finally {
-        setAllowed(prev);
-      }
+      const opts = withPackScale(this, options);
+      return patchConfigureSize.call(this, () => wrapped.call(this, opts));
     }, "MIXED");
 
   libWrapper.register(MODULE_ID,
@@ -1347,6 +1557,14 @@ function installLibWrapperPatches() {
       const picked = pickRingData(currentAllowed(), Number.isFinite(size) ? size : 1);
       if (picked) return { ...picked.ring };
       return wrapped(size);
+    }, "MIXED");
+
+  libWrapper.register(MODULE_ID,
+    "foundry.canvas.placeables.tokens.TokenRing.prototype.configureVisuals",
+    function (wrapped, ...args) {
+      const result = wrapped(...args);
+      if ( this.topName ) this.effects |= TOP_LAYER_EFFECT;
+      return result;
     }, "MIXED");
 }
 
@@ -1357,13 +1575,15 @@ function installDirectPatches() {
 
   const origConfigureSize = TokenRing.prototype.configureSize;
   TokenRing.prototype.configureSize = function (options = {}) {
-    const prev = currentAllowed();
-    try {
-      applyRingContext(this.token);
-      return origConfigureSize.call(this, options);
-    } finally {
-      setAllowed(prev);
-    }
+    const opts = withPackScale(this, options);
+    return patchConfigureSize.call(this, () => origConfigureSize.call(this, opts));
+  };
+
+  const origConfigureVisuals = TokenRing.prototype.configureVisuals;
+  TokenRing.prototype.configureVisuals = function (...args) {
+    const result = origConfigureVisuals.apply(this, args);
+    if ( this.topName ) this.effects |= TOP_LAYER_EFFECT;
+    return result;
   };
 
   const origLookup = TokenRing.getRingDataBySize;
@@ -1407,7 +1627,7 @@ function installPatches() {
 /* ------------------------------------------------------------------ */
 
 async function activateFlow() {
-  if (booted || !isEnabled()) return;
+  if (booted) return;
   if (game.release.generation < 13) return;
 
   // Self-heal: reset internal config accidentally picked as world setting
@@ -1447,6 +1667,7 @@ async function activateFlow() {
     installPatches();
     if (!featureOK) return;
 
+    topLayerClasses?.TopRingSamplerShader.ensurePlugin();
     CONFIG.Token.ring.useConfig(MEGA_ID);
     refreshUVs();
 
@@ -1495,6 +1716,17 @@ Hooks.on("createToken", (doc) => {
   if (!getEffectiveRingId(doc)) return;
   const t = canvas.tokens?.get(doc.id);
   if (t) scheduleTokenRefresh(t);
+});
+
+// Safety net for draws that raced a bake: a token that had to draw against
+// the world default re-arms its redraw chain here. Silent whenever the
+// token's pack is materialized or known-failed, so it cannot loop — the
+// redraw this schedules can only fire once the pack actually baked.
+Hooks.on("drawToken", (token) => {
+  if (!booted) return;
+  const cfgId = getEffectiveRingId(token?.document);
+  if (!cfgId || materialized.has(cfgId) || failedSheets.has(cfgId)) return;
+  scheduleTokenRefresh(token);
 });
 
 Hooks.on("deleteToken", () => scheduleEviction("token deleted"));
@@ -1679,10 +1911,11 @@ function injectRingSelect(app, element) {
       // already carries the new choice when the wearer scan runs
       setTimeout(() => {
         ensureVariantsFor(cfgId).then(ok => {
-          if (!ok) {
+          if (ok === false) {
             console.warn(`${MODULE_ID} | pre-bake of "${cfgId}" failed; it will retry on apply`);
             return;
           }
+          if (ok !== true) return; // deferred: nothing to show yet, no wearer on canvas
           for (const clone of canvas.tokens?._configPreview?.children ?? []) {
             if (getEffectiveRingId(clone?.document) !== cfgId) continue;
             try { clone.renderFlags?.set({ redraw: true }); } catch { /* noop */ }

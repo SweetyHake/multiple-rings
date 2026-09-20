@@ -78,6 +78,75 @@ The atlas is one shared pixel budget, and it follows actual usage instead of pre
 
 ---
 
+## Two-layer tokens (ring overlays)
+
+The classic token drawing order is `ring < subject` — the art always covers the ring, so a
+bezel, clasps or any other "front" part of the frame can never overlap the character. This
+module adds a third layer:
+
+```
+ring  <  subject  <  top layer
+```
+
+The top layer is part of the **ring pack sheet itself**: the sheet image carries the extra
+art, and the sheet JSON declares it in a `config.overlays` block — one entry per size
+variant, pointing at a frame rect of the same image:
+
+```json
+"config": {
+  "overlays": {
+    "dnd5e-med": { "frame": {"x": 0, "y": 1024, "w": 512, "h": 512} },
+    "dnd5e-lrg": { "frame": {"x": 512, "y": 1024, "w": 512, "h": 512} }
+  }
+}
+```
+
+- **Works like a companion frame** (`-bkg`/`-msk`): authored once per variant, keyed by the
+  base frame name, baked into the module's atlas together with the pack. A second "shadow"
+  atlas stores the overlay art at the same coordinates as the ring frames, so the shader
+  addresses it with the ring's own texture coordinates — the overlay inherits every ring
+  scale correction and stays glued to the ring at any subject scale, fit mode or zoom.
+- **Safe by design, both ways.** Neither PIXI nor the core ring renderer read
+  `config.overlays`: with the module disabled a sheet with overlays renders a perfectly
+  normal ring and the extra pixels are ignored. With the module enabled, tokens whose pack
+  has no overlays render exactly as before — the overlay shader pass is skipped entirely.
+- **Inherits everything.** The overlay lives in the same token mesh and shader pass, so
+  hidden/occluded states, invisibility effects, ring pulses, color-over-subject and the
+  token config live preview all behave as with the rest of the ring.
+
+Rendering uses the extension slot core provides for this exact purpose
+(`DynamicRingData.framework.{ringClass,shaderClass}`) — no core patching. If the core
+shader ever changes beyond recognition, the module detects it and silently disables the
+overlay (rings keep working natively).
+
+The bundled `test-ring-overlay` dev module demonstrates the format: a red banner and gold
+rivets drawn above the subject.
+
+---
+
+## Ring scale (pack-level)
+
+A ring pack sheet can declare `config.scale` — how many times larger the **ring** is drawn
+compared to the token wearing it:
+
+```json
+"config": { "scale": 2 }
+```
+
+- `scale: 2` renders the ring (with its background and top overlay) twice as large; the
+  character art keeps its normal size. Range 0.1–10, `1` or omitting the field means no
+  scaling.
+- Implemented through core's own mechanics: the scale is injected as `configureSize`'s
+  `scaleMultiplier` (`scaleCorrection = 1 / scale`), and core itself adds the mesh padding
+  required by a magnified ring — the enlarged ring is never clipped, and the subject
+  texture is untouched.
+- Applied per token wearing the pack (via `flags.multiple-rings.ringAppearance` or a
+  matching effect), picked up on the next mesh refresh.
+- **Multiple Rings only.** Core does not read `config.scale`; with the module disabled the
+  field is inert and the sheet stays a normal ring sheet.
+
+---
+
 ## Good to know
 
 - **No FPS cost.** Rings render exactly like vanilla; everything happens when tokens are drawn, not every frame.
