@@ -1,6 +1,5 @@
 {
   "MRINGS.SelectLabel": "Кольцо токена",
-  "MRINGS.FieldLabel": "Текстура кольца",
   "MRINGS.WorldDefault": "По умолчанию",
   "MRINGS.CombinedConfigLabel": "Multiple Rings",
   "MRINGS.WarnNoSheets": "Кольца не найдены.",

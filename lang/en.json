@@ -1,6 +1,5 @@
 {
   "MRINGS.SelectLabel": "Token Ring",
-  "MRINGS.FieldLabel": "Ring Texture",
   "MRINGS.WorldDefault": "Default",
   "MRINGS.CombinedConfigLabel": "Multiple Rings",
   "MRINGS.WarnNoSheets": "No rings found.",

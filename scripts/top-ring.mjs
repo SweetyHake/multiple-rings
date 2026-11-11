@@ -16,8 +16,7 @@
  * Neither PIXI nor the core ring renderer read that block, so with the
  * module disabled the sheet renders a perfectly normal ring and the overlay
  * pixels are simply ignored. With the module enabled, the overlay frames are
- * baked into the combined atlas like any other companion (-bkg/-msk) and
- * drawn ABOVE the token subject.
+ * baked into a shadow atlas and drawn ABOVE the token subject.
  *
  * Rendering goes through the framework slot core provides for this exact
  * purpose (`DynamicRingData.framework.{ringClass,shaderClass}`). Core's ring
@@ -28,10 +27,11 @@
  * with the ring's own UVs. Tokens without an overlay pack the state bit off
  * and never touch the sampler.
  *
- * Everything is created lazily via buildTopLayerClasses() — the classes
- * subclass core classes that are only addressed from the activation flow,
- * and a structural check on the core shader source falls back to "no top
- * layer" instead of rendering broken rings after a core change.
+ * The fragment shader is NOT a copy of core's: it is derived at runtime from
+ * the live core source by injecting three small snippets at well-known
+ * anchors. Core fixes therefore carry over automatically, and when an anchor
+ * disappears (core changed beyond recognition) the top layer is disabled
+ * instead of rendering broken rings.
  */
 
 const MODULE_ID = "multiple-rings";
@@ -39,19 +39,72 @@ const MODULE_ID = "multiple-rings";
 /** Module-private effect bit, above core's 0x01..0x20 range. */
 export const TOP_LAYER_EFFECT = 0x40;
 
-/** Markers the core shader must contain for the copied GLSL below to be
- * considered in sync (a cheap structural diff against upstream edits). */
-const FRAG_MARKERS = ["STATE_COLOR_OVER_SUBJECT", "rectangularMask", "colorizeTokenRing"];
-const VERT_MARKERS = ["aTextureScaleCorrection", "aRingColorBand"];
+/** Fragment injections: [anchor regex, replacement builder]. Every anchor
+ * must match exactly once or the top layer stays off. */
+const FRAG_INJECTIONS = [
+  // Extra sampler, declared next to core's ring sampler
+  [/uniform\s+sampler2D\s+tokenRingTexture\s*;/,
+    m => `${m}\n    uniform sampler2D mrTopTexture;`],
+  // Module state bit, declared next to core's last state constant
+  [/const\s+uint\s+STATE_COLOR_OVER_SUBJECT\s*=\s*0x20U\s*;/,
+    m => `${m}\n    const uint STATE_TOP_LAYER = ${`0x${TOP_LAYER_EFFECT.toString(16)}`}U;`],
+  // Top-layer blend, right before core's final alpha adjustment (or a
+  // token-shader wrapper such as Showstopper's ssApplyTokenShader(blendedResult, ...)
+  // when another module patched TokenRingSamplerShader before us)
+  [/result\s*=\s*(?:blendedResult|[A-Za-z_]\w*\s*\(\s*blendedResult\b[^;]*\))\s*\*\s*vColor\.a\s*;/,
+    m => `
+    // Top layer: ring-sheet frame drawn ABOVE the ring, all its effects, and
+    // the subject. The shadow atlas stores overlay frames at the same rects as
+    // the combined atlas, so the ring's own UVs address it. Dynamic ring colors
+    // and effects (vRingColor, vBackgroundColor, flashColor, pulse, gradient,
+    // wave, colorOverSubject) never touch the overlay; PIXI mesh tint (vColor)
+    // and worldAlpha (vColor.a) apply to it identically to the token subject.
+    if ( hasState(STATE_TOP_LAYER) ) {
+      vec4 mrTop = texture(mrTopTexture, vRingTextureCoord);
+      vec4 mrTopPremul = vec4(unpremultiplySafe(mrTop), 1.0) * (mrTop.a * rectangularMask);
+      vec4 mrTopTinted = (vColor.a > 0.0) ? (mrTopPremul * (vColor / vColor.a)) : vec4(0.0);
+      blendedResult = blend(mrTopTinted, blendedResult);
+    }
+    ${m}`]
+];
+
+/** Symbols the injected code relies on. */
+const FRAG_REQUIRED = [
+  "hasState", "blend(", "unpremultiplySafe", "rectangularMask",
+  "vRingTextureCoord", "vColor", "blendedResult"
+];
+
+/**
+ * Derive the top-layer fragment shader from core's, or null when the core
+ * source no longer has the expected structure.
+ * @param {string} frag
+ * @returns {string|null}
+ */
+function deriveFragmentShader(frag) {
+  if (!frag || !FRAG_REQUIRED.every(s => frag.includes(s))) return null;
+  let out = frag;
+  for (const [re, build] of FRAG_INJECTIONS) {
+    const global = new RegExp(re.source, "g");
+    const hits = out.match(global);
+    if (!hits || hits.length !== 1) return null;
+    out = out.replace(re, m => build(m));
+  }
+  return out;
+}
 
 export function buildTopLayerClasses() {
   const TokenRing = foundry.canvas.placeables.tokens.TokenRing;
   const NativeShader = foundry.canvas.rendering.shaders.TokenRingSamplerShader;
 
-  const frag = String(NativeShader._batchFragmentShader ?? "");
-  const vert = String(NativeShader._batchVertexShader ?? "");
-  const inSync = FRAG_MARKERS.every(m => frag.includes(m)) && VERT_MARKERS.every(m => vert.includes(m));
-  if ( !inSync ) {
+  // The private bit must not collide with an effect core (or a system) added
+  const usedBits = Object.values(TokenRing?.effects ?? {}).reduce((acc, v) => acc | (Number(v) || 0), 0);
+  if (usedBits & TOP_LAYER_EFFECT) {
+    console.warn(`${MODULE_ID} | top layer disabled: effect bit 0x${TOP_LAYER_EFFECT.toString(16)} is already used by core`);
+    return null;
+  }
+
+  const fragment = deriveFragmentShader(String(NativeShader?._batchFragmentShader ?? ""));
+  if (!fragment) {
     console.warn(`${MODULE_ID} | top layer disabled: the core TokenRingSamplerShader changed beyond recognition`);
     return null;
   }
@@ -62,25 +115,15 @@ export function buildTopLayerClasses() {
   // in this closure instead and is swapped by setTopAtlas() at atlas commits.
   let topAtlas = null;
   let emptyTexture = null;
-  const bindTarget = () => topAtlas ?? (emptyTexture ??= PIXI.BaseTexture.from(_emptyTopCanvas()));
+  const bindTarget = () => {
+    if (topAtlas && !topAtlas.destroyed) return topAtlas;
+    return (emptyTexture ??= PIXI.BaseTexture.from(_emptyTopCanvas()));
+  };
 
   class TopRingSamplerShader extends NativeShader {
 
     /** @override — own batch plugin; geometry/vertex layout is core's */
     static classPluginName = "multipleRingsTopBatch";
-
-    /**
-     * Core's ring shader already uses all 16 vertex attribute slots WebGL
-     * guarantees, so the overlay cannot travel as an attribute. Instead the
-     * module maintains a shadow atlas of the same dimensions in which overlay
-     * frames are baked at the SAME rects as their ring frames in the combined
-     * atlas — the overlay is then sampled with the ring's own UVs
-     * (vRingTextureCoord), which also makes it inherit every ring scale
-     * correction for free.
-     */
-    static setTopAtlas(baseTexture) {
-      topAtlas = baseTexture;
-    }
 
     /** @override — one extra texture unit for the shadow atlas (core: occlusion + ring) */
     static reservedTextureUnits = NativeShader.reservedTextureUnits + 1;
@@ -104,255 +147,57 @@ export function buildTopLayerClasses() {
      * done: the constructor self-registers on the contextChange runner).
      */
     static ensurePlugin() {
-      if ( this.__pluginInstalled ) return;
       const name = this.classPluginName;
+      const renderer = globalThis.canvas?.app?.renderer;
+      if ( this.__pluginInstalled && (!renderer || renderer.plugins[name]) ) return true;
       try {
-        if ( !foundry.canvas.rendering.batching.BatchRenderer.hasPlugin(name) ) {
+        const BatchRenderer = foundry.canvas?.rendering?.batching?.BatchRenderer;
+        if ( !BatchRenderer ) return false;
+        if ( !BatchRenderer.hasPlugin(name) ) {
+          this.initializeBatchGeometry?.();
           PIXI.extensions.add({name, type: PIXI.ExtensionType.RendererPlugin, ref: this.createPlugin()});
         }
-        const renderer = canvas.app?.renderer;
-        if ( renderer && !renderer.plugins[name] ) {
-          const pluginClass = PIXI.Renderer.__plugins[name];
-          const plugin = new pluginClass(renderer);
-          renderer.plugins[name] = plugin;
-          plugin.contextChange();
+        if ( renderer ) {
+          if ( !renderer.plugins[name] ) {
+            const pluginClass = PIXI.Renderer.__plugins[name];
+            if ( !pluginClass ) return false;
+            const plugin = new pluginClass(renderer);
+            renderer.plugins[name] = plugin;
+            plugin.contextChange();
+            plugin.onPrerender?.();
+          }
+          this.__pluginInstalled = true;
         }
-        this.__pluginInstalled = true;
+        return true;
       } catch (e) {
         console.warn(`${MODULE_ID} | top layer plugin installation failed — overlay stays off`, e);
+        return false;
       }
     }
 
     /** @override — bind the shadow atlas right after core binds the ring one */
     static _preRenderBatch(batchRenderer) {
       super._preRenderBatch(batchRenderer);
-      const uniforms = batchRenderer._shader?.uniforms;
-      if ( uniforms ) batchRenderer.renderer.texture.bind(bindTarget(), uniforms.mrTopTexture);
+      const unit = batchRenderer.uniforms?.mrTopTexture ?? batchRenderer._shader?.uniforms?.mrTopTexture;
+      if ( unit !== undefined ) batchRenderer.renderer.texture.bind(bindTarget(), unit);
     }
-
-    /* ---------------------------------------- */
-    /*  GLSL                                    */
-    /* ---------------------------------------- */
 
     /* The vertex body is inherited unchanged: the overlay reuses the ring's
      * own UV attribute, so no geometry or packing changes are needed. */
 
-    /** @override — core's fragment body + the STATE_TOP_LAYER blend */
-    static _batchFragmentShader = `
-      ${this.CONSTANTS}
-      ${this.PERCEIVED_BRIGHTNESS}
+    /** @override — core's live fragment source + the STATE_TOP_LAYER blend */
+    static _batchFragmentShader = fragment;
+  }
 
-      in vec2 vRingTextureCoord;
-      in vec2 vBackgroundTextureCoord;
-      in vec2 vMaskTextureCoord;
-      in vec2 vOrigTextureCoord;
-      flat in vec3 vRingColor;
-      flat in vec3 vBackgroundColor;
-      flat in vec2 vScaleCorrection;
-      flat in vec2 vRingColorBand;
-      flat in uint vStates;
-
-      uniform sampler2D tokenRingTexture;
-      uniform sampler2D mrTopTexture;
-      uniform float time;
-      uniform bool debugColorBands;
-
-      const uint STATE_RING_PULSE = 0x02U;
-      const uint STATE_RING_GRADIENT = 0x04U;
-      const uint STATE_BKG_WAVE = 0x08U;
-      const uint STATE_INVISIBLE = 0x10U;
-      const uint STATE_COLOR_OVER_SUBJECT = 0x20U;
-      const uint STATE_TOP_LAYER = 0x40U;
-
-      vec4 colorOverlay;
-
-      /* -------------------------------------------- */
-
-      bool hasState(in uint state) {
-        return (vStates & state) == state;
-      }
-
-      /* -------------------------------------------- */
-
-      vec2 rotation(in vec2 uv, in float angle) {
-        uv -= 0.5;
-        float s = sin(angle);
-        float c = cos(angle);
-        return uv * mat2(c, -s, s, c) + 0.5;
-      }
-
-      /* -------------------------------------------- */
-
-      float normalizedCos(in float val) {
-        return (cos(val) + 1.0) * 0.5;
-      }
-
-      /* -------------------------------------------- */
-
-      float wave(in float dist) {
-        return 0.5 * sin(-time * 4.0 + dist * 100.0) + 0.9;
-      }
-
-      /* -------------------------------------------- */
-
-      vec4 blend(vec4 src, vec4 dst) {
-        return src + (dst * (1.0 - src.a));
-      }
-
-      /* -------------------------------------------- */
-
-      vec3 unpremultiplySafe(in vec4 c) {
-        if ( c.a <= 0.0 ) return vec3(0.0);
-        return min(c.rgb, vec3(c.a)) / c.a;
-      }
-
-      /* -------------------------------------------- */
-
-      vec4 colorizeTokenRing(in vec4 tokenRing, in float dist) {
-        vec3 tokenColor = unpremultiplySafe(tokenRing);
-
-        // Sample the mask texture
-        vec4 maskTex = texture(tokenRingTexture, vMaskTextureCoord);
-        vec3 maskColor = unpremultiplySafe(maskTex);
-
-        // Compute red channel based on mask if available, otherwise fall back to token color
-        float redChannel = (maskTex.a > 0.0) ? maskColor.r : tokenColor.r;
-
-        // Compute pulse factor, but only if the pulse state is active
-        float pulseFactor = 1.0;
-        if ( hasState(STATE_RING_PULSE) ) pulseFactor = cos(time * 2.0) * 0.325 + 0.675;
-
-        // Compute the base pulse color
-        vec3 pulseColor = vRingColor * redChannel * pulseFactor;
-
-        // Compute gradient color if the gradient state is active
-        vec3 gradientColor = pulseColor;
-        if ( hasState(STATE_RING_GRADIENT) ) {
-          // Calculate gradient mix based on rotation and time
-          float gradientMix = smoothstep(0.0, 1.0, dot(rotation(vTextureCoord, time), vec2(0.5)));
-          gradientColor = mix(pulseColor, vBackgroundColor * redChannel, gradientMix);
-        }
-
-        // Compute mixFactor based on ring color bands
-        float mixFactor = step(vRingColorBand.x, dist) - step(vRingColorBand.y, dist);
-
-        if ( hasState(STATE_COLOR_OVER_SUBJECT) ) {
-          float mixAdjusted = mixFactor * tokenRing.a;
-          if ( maskTex.a > 0.0 ) colorOverlay = vec4(gradientColor, 1.0) * maskTex.a;
-          else colorOverlay = vec4(gradientColor, 1.0) * mixAdjusted;
-          return tokenRing * (1.0 - mixAdjusted);
-        }
-
-        // Compute the final color by mixing tokenColor and gradientColor based on mixFactor
-        vec4 finalColor = vec4(mix(tokenColor, gradientColor, mixFactor), 1.0) * tokenRing.a;
-
-        // If mask is present, blend the final color with the mask color
-        if ( maskTex.a > 0.0 ) finalColor = blend(vec4(gradientColor, 1.0) * maskTex.a, finalColor);
-        return finalColor;
-      }
-
-      /* -------------------------------------------- */
-
-      vec4 colorizeTokenBackground(in vec4 tokenBackground, in float dist) {
-        // Pre-correct the background color for alpha if necessary
-        vec3 bgColor = (tokenBackground.a > 0.0) ? tokenBackground.rgb / tokenBackground.a : tokenBackground.rgb;
-
-        // Calculate the wave factor based on the state
-        float waveFactor = hasState(STATE_BKG_WAVE) ? (0.5 + wave(dist) * 1.5) : 1.0;
-
-        // Check if tint color is pure white (no tint)
-        vec3 tintColor = vBackgroundColor.rgb;
-        vec3 resultColor = bgColor;
-
-        // Apply overlay blend mode only if tint is not white
-        if ( tintColor != vec3(1.0, 1.0, 1.0) ) {
-          // Overlay blend: vectorized for each RGB channel
-          resultColor = mix(2.0 * bgColor * tintColor,
-                            1.0 - 2.0 * (1.0 - bgColor) * (1.0 - tintColor),
-                            step(0.5, bgColor));
-        }
-
-        // Return the final color with alpha and wave applied
-        return vec4(resultColor, 1.0) * tokenBackground.a * waveFactor;
-      }
-
-      /* -------------------------------------------- */
-
-      vec4 processTokenColor(in vec4 finalColor) {
-        if ( !hasState(STATE_INVISIBLE) ) return finalColor;
-
-        // Computing halo
-        float lum = perceivedBrightness(unpremultiplySafe(finalColor));
-        vec3 haloColor = vec3(lum) * vec3(0.5, 1.0, 1.0);
-
-        // Construct final image
-        return vec4(haloColor, 1.0) * finalColor.a
-                     * (0.55 + normalizedCos(time * 2.0) * 0.25);
-      }
-
-      /* -------------------------------------------- */
-
-      float getTokenTextureClip() {
-        // Check if both x and y coordinates are within the [0.0, 1.0] range
-        return step(0.0, vTextureCoord.x) * step(0.0, vTextureCoord.y) *
-               step(vTextureCoord.x, 1.0) * step(vTextureCoord.y, 1.0);
-      }
-
-      /* -------------------------------------------- */
-
-      vec4 _main() {
-        vec4 color;
-        vec4 result;
-
-        %forloop%
-
-        // Compute distances for further processing
-        vec2 scaledDistVec = (vOrigTextureCoord - 0.5) * 2.0 * vScaleCorrection;
-        float dist = length(scaledDistVec);  // Euclidean distance
-
-        // Rectangular mask to not bleed over other spritesheet assets
-        float rectangularMask = step(max(abs(scaledDistVec.x), abs(scaledDistVec.y)), 1.0);
-
-        // Clip token texture to handle padding on X/Y axis
-        color *= getTokenTextureClip();
-
-        // Precompute alpha-adjusted color (avoid division by 0)
-        vec4 alphaAdjustedColor = (vColor.a > 0.0) ? (color * (vColor / vColor.a)) : vec4(0.0);
-
-        // Process token color using a custom function
-        vec4 processedColor = processTokenColor(alphaAdjustedColor);
-
-        // Blend token texture, token ring, and token background
-        vec4 ringColor = colorizeTokenRing(texture(tokenRingTexture, vRingTextureCoord), dist);
-        vec4 backgroundColor = colorizeTokenBackground(texture(tokenRingTexture, vBackgroundTextureCoord), dist);
-        vec4 blendedResult = blend(processedColor, blend(ringColor, backgroundColor) * rectangularMask);
-
-        // Apply color overlay if the state is active
-        if ( hasState(STATE_COLOR_OVER_SUBJECT) ) blendedResult = blend(colorOverlay * rectangularMask, blendedResult);
-
-        // Top layer: ring-sheet frame drawn ABOVE the subject. The shadow
-        // atlas stores overlay frames at the same rects as the combined
-        // atlas, so the ring's own UVs address it. Overlay art is authored
-        // neutral and is multiplied by the ring color, so it matches the
-        // tinted band (pulse/gradient do not apply to it). Premultiply to
-        // feed the same src-over chain core uses for its mask colorOverlay.
-        if ( hasState(STATE_TOP_LAYER) ) {
-          vec4 topColor = texture(mrTopTexture, vRingTextureCoord);
-          topColor = vec4(topColor.rgb * vRingColor, topColor.a);
-          blendedResult = blend(vec4(topColor.rgb, 1.0) * (topColor.a * rectangularMask), blendedResult);
-        }
-
-        // Apply final alpha adjustment
-        result = blendedResult * vColor.a;
-
-        if ( debugColorBands ) {
-          vec2 debugDistVec = (vTextureCoord - 0.5) * 2.0 * vScaleCorrection;
-          float debugDist = length(debugDistVec);
-          result.rgb += vec3(0.0, 0.5, 0.0) * (step(vRingColorBand.x, debugDist) - step(vRingColorBand.y, debugDist));
-        }
-        return result;
-      }
-    `;
+  // If NativeShader was already patched in-place by Showstopper before
+  // deriveFragmentShader ran, `fragment` already includes its GLSL helpers —
+  // mark TopRingSamplerShader with its own flag so Showstopper's addConfig /
+  // useConfig hooks do not inject those helpers a second time.
+  if (Object.prototype.hasOwnProperty.call(NativeShader, "__showstopperRingPatched")) {
+    Object.defineProperty(TopRingSamplerShader, "__showstopperRingPatched", {
+      value: true,
+      configurable: true
+    });
   }
 
   /* The top layer deliberately does NOT subclass TokenRing: core recreates
@@ -362,7 +207,13 @@ export function buildTopLayerClasses() {
    * TokenRing.prototype by installPatches() in main.js — they work on every
    * instance regardless of when it was created. */
 
-  return {TopRingSamplerShader, setTopAtlas: t => { topAtlas = t; }};
+  // Register the PIXI extension early (during initializeDynamicTokenRingConfig,
+  // before PIXI.Application is created) so PIXI's PluginSystem wires all
+  // renderer runners natively; ensurePlugin() remains a fallback for late
+  // registration.
+  TopRingSamplerShader.ensurePlugin();
+
+  return {TopRingSamplerShader, setTopAtlas: t => { topAtlas = t ?? null; }};
 }
 
 /** 1×1 transparent canvas backing the shader's fallback bind target. */

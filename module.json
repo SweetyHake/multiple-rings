@@ -1,17 +1,18 @@
 {
   "id": "multiple-rings",
   "title": "Multiple Rings",
-  "version": "14.3.0",
+  "version": "14.4.0",
   "compatibility": {
     "minimum": "13",
     "verified": "14",
     "maximum": "14"
   },
   "relationships": {
-    "requires": [
+    "recommends": [
       {
         "id": "lib-wrapper",
         "type": "module",
+        "reason": "Cooperative patching with other modules; without it the module patches TokenRing directly.",
         "compatibility": {}
       }
     ]
